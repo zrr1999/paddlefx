@@ -7,7 +7,7 @@ import paddle
 import paddlefx
 
 if TYPE_CHECKING:
-    from tvm import te
+    import tvm.relay
 
 
 def paddle_dtype_to_str(dtype: paddle.dtype) -> str:
@@ -56,66 +56,68 @@ class CompilerBase:
 
 
 class TVMCompiler(CompilerBase):
-    def gen_compiled_func(self, symbol_table: dict[str, te.Tensor], dummy_outputs: Any):
+    def gen_compiled_func(
+        self, symbol_table: dict[str, tvm.relay.Var], dummy_outputs: Any
+    ):
         import tvm
 
-        from tvm import te
+        from tvm import relay
+        from tvm.contrib import graph_executor
 
-        tgt = tvm.target.Target(target="llvm", host="llvm")
-        schedule = te.create_schedule(symbol_table["output"].op)
-        tvm_func = tvm.build(
-            schedule,
-            [
-                v
-                for k, v in symbol_table.items()
-                if v.name.startswith("input") or k == "output"
-            ],
-            tgt,
-            name=symbol_table["output"].name,
-        )
+        output = symbol_table["output"]
+        func = relay.Function(relay.analysis.free_vars(output), output)
+        ir_mod = tvm.IRModule()
+        ir_mod["main"] = func
+
+        target = "llvm"
+        with tvm.transform.PassContext(opt_level=0):
+            lib = relay.build(ir_mod, target, params={})
+        dev = tvm.device(target, 0)
+        graph_mod = graph_executor.GraphModule(lib["default"](dev))
 
         def compiled_func(*args):
-            inputs = [tvm.nd.array(arg.numpy()) for arg in args]
+            inputs = {
+                name: tvm.nd.array(arg.numpy(), dev)
+                for (name, var), arg in zip(symbol_table.items(), args)
+                if var.name_hint.startswith("input")
+            }
             dummy_output = dummy_outputs[0]
             output = tvm.nd.empty(
                 dummy_output.shape, paddle_dtype_to_str(dummy_output.dtype)
             )
-            tvm_func(*inputs, output)
-            output = paddle.to_tensor(output.asnumpy())
+            graph_mod.run(**inputs)
+            output = paddle.to_tensor(graph_mod.get_output(0).numpy())
             return (output,)
 
         return compiled_func
 
     def compile_placeholder(
-        self, node: paddlefx.Node, symbol_table: dict[str, te.Tensor], inputs: list
+        self, node: paddlefx.Node, symbol_table: dict[str, tvm.relay.Var], inputs: list
     ):
-        from tvm import te
+        import tvm.relay
 
-        symbol_table[node.name] = te.placeholder(
-            inputs[self.input_index].shape,
-            paddle_dtype_to_str(inputs[self.input_index].dtype),
-            name=f"input_{node.name}",
+        symbol_table[node.name] = tvm.relay.var(
+            f"input_{node.name}",
+            shape=inputs[self.input_index].shape,
+            dtype=paddle_dtype_to_str(inputs[self.input_index].dtype),
         )
         self.input_index += 1
 
     def compile_call_function(
-        self, node: paddlefx.Node, symbol_table: dict[str, te.Tensor], inputs: list
+        self, node: paddlefx.Node, symbol_table: dict[str, tvm.relay.Var], inputs: list
     ):
-        from tvm import te
+        import tvm.relay
 
-        if node.target.__name__ in ["add", "sub", "mul", "div"]:
+        if node.target.__name__ in ["add", "sub", "mul", "truediv"]:
             left = symbol_table[str(node.args[0])]
             right = symbol_table[str(node.args[1])]
-            symbol_table[str(node.name)] = te.compute(  # type: ignore
-                left.shape,
-                lambda *i: node.target(left[i], right[i]),
-                name=str(node.name),
-            )
+            tvm_relay_func = getattr(tvm.relay, node.target.__name__)
+            symbol_table[str(node.name)] = tvm_relay_func(left, right)
         else:
             raise NotImplementedError(f"Unsupported function: {node.target.__name__}")
 
     def compile_output(
-        self, node: paddlefx.Node, symbol_table: dict[str, te.Tensor], inputs: list
+        self, node: paddlefx.Node, symbol_table: dict[str, tvm.relay.Var], inputs: list
     ):
         ret = symbol_table[str(node.args[0][0])]
         symbol_table["output"] = ret
